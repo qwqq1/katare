@@ -9,39 +9,36 @@ const http = require('http');
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 
-// --- 辅助函数：转义 Telegram Markdown 特殊字符 ---
+// --- 辅助函数：转义 Telegram Markdown v1 特殊字符 ---
 function escapeMarkdown(text) {
-    return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+    return text.replace(/([_*`\[])/g, '\\$1');
 }
 
-// --- 辅助函数：发送 Telegram ---
+// --- 辅助函数：发送 Telegram（图文合并为一条消息） ---
 async function sendTelegramMessage(message, imagePath = null) {
     if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
     try {
-        const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
-        await axios.post(url, {
-            chat_id: TG_CHAT_ID,
-            text: message,
-            parse_mode: 'Markdown'
-        });
-        console.log('[Telegram] Message sent.');
-    } catch (e) {
-        console.error('[Telegram] Failed to send message:', e.message);
-    }
-    if (imagePath && fs.existsSync(imagePath)) {
-        try {
-            console.log('[Telegram] Sending photo...');
+        if (imagePath && fs.existsSync(imagePath)) {
             const FormData = require('form-data');
             const form = new FormData();
             form.append('chat_id', TG_CHAT_ID);
             form.append('photo', fs.createReadStream(imagePath));
+            form.append('caption', message);
+            form.append('parse_mode', 'Markdown');
             await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto`, form, {
                 headers: form.getHeaders()
             });
-            console.log('[Telegram] Photo sent.');
-        } catch (e) {
-            console.error('[Telegram] Failed to send photo:', e.message);
+            console.log('[Telegram] Photo with caption sent.');
+        } else {
+            await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
+                chat_id: TG_CHAT_ID,
+                text: message,
+                parse_mode: 'Markdown'
+            });
+            console.log('[Telegram] Message sent.');
         }
+    } catch (e) {
+        console.error('[Telegram] Failed to send:', e.message);
     }
 }
 
