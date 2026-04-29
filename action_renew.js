@@ -846,14 +846,25 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                                     let dateStr = match ? match[1] : 'Unknown Date';
                                     console.log(`   >> ⏳ 暂无法续期 (还没到时间)。下次可续期: ${dateStr}`);
                                     renewSuccess = true;
-                                    
+
                                     const skipScreenshot = path.join(photoDir, `${safeUsername}_skip.png`);
+                                    let modalClosed = false;
+                                    try {
+                                        const closeBtn = modal.getByLabel('Close');
+                                        if (await closeBtn.isVisible()) {
+                                            await closeBtn.click();
+                                            await modal.waitFor({ state: 'hidden', timeout: 3000 }).catch(() => {});
+                                            await page.waitForTimeout(500);
+                                            modalClosed = !await modal.isVisible().catch(() => false);
+                                        }
+                                    } catch (e) {}
+
+                                    if (!modalClosed) {
+                                        console.log('   >> Renew 弹窗未能完全关闭，使用当前页面状态截图。');
+                                    }
+
                                     try { await saveViewportScreenshot(page, skipScreenshot); } catch (e) {}
                                     await sendTelegramMessage(`⏳ *${escapeMarkdown(user.username)}*\n暂无法续期，下次可续期时间: ${dateStr}`, skipScreenshot);
-                                    try { 
-                                        const closeBtn = modal.getByLabel('Close'); 
-                                        if (await closeBtn.isVisible()) await closeBtn.click(); 
-                                    } catch(e){}
                                     break;
                                 }
                                 await page.waitForTimeout(200);
