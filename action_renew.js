@@ -207,11 +207,69 @@ async function saveViewportScreenshot(page, imagePath) {
     await page.screenshot({ path: imagePath, fullPage: false });
 }
 
+function maskUsernameForLog(username) {
+    const value = String(username || '').trim();
+    if (!value) return '(empty)';
+
+    const atIndex = value.indexOf('@');
+    if (atIndex <= 1) {
+        if (value.length <= 3) return `${value[0] || '*'}**`;
+        return `${value.slice(0, 1)}***${value.slice(-1)}`;
+    }
+
+    const name = value.slice(0, atIndex);
+    const domain = value.slice(atIndex + 1);
+    const maskedName = name.length <= 2 ? `${name[0] || '*'}*` : `${name.slice(0, 2)}***`;
+    return `${maskedName}@${domain}`;
+}
+
 function getUsers() {
     try {
         if (process.env.USERS_JSON) {
             const parsed = JSON.parse(process.env.USERS_JSON);
-            return Array.isArray(parsed) ? parsed : (parsed.users || []);
+            let rawUsers = [];
+
+            if (Array.isArray(parsed)) {
+                rawUsers = parsed;
+            } else if (parsed && Array.isArray(parsed.users)) {
+                rawUsers = parsed.users;
+            } else if (parsed && typeof parsed === 'object' && (parsed.username || parsed.password)) {
+                rawUsers = [parsed];
+            }
+
+            const users = [];
+            const seenUsernames = new Set();
+
+            for (const entry of rawUsers) {
+                if (!entry || typeof entry !== 'object') {
+                    console.log('[用户配置] 跳过无效条目: 非对象。');
+                    continue;
+                }
+
+                const username = String(entry.username || entry.email || '').trim();
+                const password = String(entry.password || '').trim();
+
+                if (!username || !password) {
+                    console.log(`[用户配置] 跳过无效条目: username/password 不完整 (${maskUsernameForLog(username)})`);
+                    continue;
+                }
+
+                const dedupeKey = username.toLowerCase();
+                if (seenUsernames.has(dedupeKey)) {
+                    console.log(`[用户配置] 跳过重复账号: ${maskUsernameForLog(username)}`);
+                    continue;
+                }
+
+                seenUsernames.add(dedupeKey);
+                users.push({ username, password });
+            }
+
+            console.log(`[用户配置] USERS_JSON 原始条目 ${rawUsers.length}，有效用户 ${users.length}`);
+            if (users.length > 0) {
+                console.log(`[用户配置] 本次执行账号: ${users.map((user) => maskUsernameForLog(user.username)).join(', ')}`);
+            }
+
+            return users;
         }
     } catch (e) {
         console.error('解析 USERS_JSON 环境变量错误:', e);
@@ -337,75 +395,135 @@ async function solveTurnstileIfPresent(page, stageName = "登录", maxAttempts =
 // ==========================================
 // ========== 2. ALTCHA 专区 (Renew用) =========
 // ==========================================
-async function checkAltchaSuccess(page) {
+async function getAltchaStatus(page) {
     try {
-        // ALTCHA 官方组件状态检查：检查内部 state 或隐藏的 input
-        const isSolved = await page.evaluate(() => {
+        return await page.evaluate(() => {
+            const normalize = (value) => {
+                if (value == null) return '';
+                return String(value).trim();
+            };
+
             const widget = document.querySelector('altcha-widget');
-            if (widget) {
-                // 如果组件自己说验证过了，那就肯定过了
-                if (widget.state === 'verified') return true;
-                if (widget.value && String(widget.value).length > 0) return true;
-            }
-            // 备用：检查表单中是否有隐藏的 value
-            const input = document.querySelector('input[name="altcha"]');
-            if (input && input.value && input.value.trim().length > 0) return true;
-            
-            return false;
+            const altchaInputs = Array.from(document.querySelectorAll('input[name="altcha"], textarea[name="altcha"], input[name*="altcha" i], textarea[name*="altcha" i]'));
+            const firstFilledInput = altchaInputs.find((input) => normalize(input.value).length > 0);
+            const shadowRoot = widget ? widget.shadowRoot : null;
+            const checkbox = shadowRoot ? shadowRoot.querySelector('input[type="checkbox"], [role="checkbox"]') : null;
+
+            const stateProp = normalize(widget ? widget.state : '');
+            const stateAttr = normalize(widget ? widget.getAttribute('state') : '');
+            const valueProp = normalize(widget ? widget.value : '');
+            const valueAttr = normalize(widget ? widget.getAttribute('value') : '');
+            const hiddenInputValue = normalize(firstFilledInput ? firstFilledInput.value : '');
+            const checkboxChecked = checkbox && typeof checkbox.checked === 'boolean' ? checkbox.checked : null;
+            const ariaChecked = normalize(checkbox ? checkbox.getAttribute('aria-checked') : '');
+            const busyAttr = normalize(widget ? widget.getAttribute('aria-busy') : '');
+            const state = stateProp || stateAttr || '';
+            const isSolved = state === 'verified' || valueProp.length > 0 || valueAttr.length > 0 || hiddenInputValue.length > 0;
+            const isVerifying = !isSolved && (
+                state === 'verifying' ||
+                state === 'processing' ||
+                state === 'working' ||
+                checkboxChecked === true ||
+                ariaChecked === 'true' ||
+                busyAttr === 'true'
+            );
+
+            return {
+                exists: !!widget || altchaInputs.length > 0,
+                solved: isSolved,
+                isVerifying,
+                state: state || 'unknown',
+                hasShadowRoot: !!shadowRoot,
+                checkboxChecked,
+                ariaChecked,
+                valueLength: Math.max(valueProp.length, valueAttr.length),
+                hiddenInputLength: hiddenInputValue.length,
+                busy: busyAttr === 'true'
+            };
         });
-        return isSolved;
-    } catch (e) { 
-        return false;
+    } catch (e) {
+        return {
+            exists: false,
+            solved: false,
+            isVerifying: false,
+            state: 'error',
+            hasShadowRoot: false,
+            checkboxChecked: null,
+            ariaChecked: '',
+            valueLength: 0,
+            hiddenInputLength: 0,
+            busy: false
+        };
     }
 }
 
-async function attemptAltchaClick(page) {
+function formatAltchaStatus(status) {
+    const checkedText = status.checkboxChecked === null ? 'unknown' : String(status.checkboxChecked);
+    const ariaChecked = status.ariaChecked || 'n/a';
+    return `state=${status.state}, solved=${status.solved}, verifying=${status.isVerifying}, shadow=${status.hasShadowRoot}, checked=${checkedText}, ariaChecked=${ariaChecked}, valueLen=${status.valueLength}, hiddenLen=${status.hiddenInputLength}, busy=${status.busy}`;
+}
+
+async function checkAltchaSuccess(page) {
+    const status = await getAltchaStatus(page);
+    return status.solved;
+}
+
+async function attemptAltchaClick(page, currentStatus = null) {
     try {
         const altchaWidget = page.locator('altcha-widget').first();
         if (await altchaWidget.count() > 0) {
-            
-            if (await checkAltchaSuccess(page)) return false; 
+
+            const status = currentStatus || await getAltchaStatus(page);
+            if (status.solved) return false;
+            if (status.isVerifying) {
+                console.log(`>> ALTCHA 正在验证中，跳过重复点击。${formatAltchaStatus(status)}`);
+                return false;
+            }
 
             await page.waitForTimeout(500);
             await altchaWidget.scrollIntoViewIfNeeded().catch(() => {});
 
-            // 🌟 核心修复：穿透 Shadow DOM，获取真正复选框的精确坐标，不再靠猜！
             let boxInfo = await page.evaluate(() => {
                 const widget = document.querySelector('altcha-widget');
                 if (!widget) return null;
-                
+
+                const pickClickTarget = (root) => {
+                    if (!root) return null;
+                    return root.querySelector('input[type="checkbox"], [role="checkbox"], label, button');
+                };
+
                 if (widget.shadowRoot) {
-                    // 寻找真正的 checkbox 元素
-                    const cb = widget.shadowRoot.querySelector('input[type="checkbox"]');
-                    if (cb) {
-                        const rect = cb.getBoundingClientRect();
-                        return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: true };
+                    const target = pickClickTarget(widget.shadowRoot);
+                    if (target) {
+                        const rect = target.getBoundingClientRect();
+                        return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: true, tagName: target.tagName };
                     }
                 }
-                // 没找到就返回大框
+
+                const lightDomTarget = pickClickTarget(widget);
+                if (lightDomTarget) {
+                    const rect = lightDomTarget.getBoundingClientRect();
+                    return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: true, tagName: lightDomTarget.tagName };
+                }
+
                 const rect = widget.getBoundingClientRect();
-                return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: false };
+                return { x: rect.left, y: rect.top, width: rect.width, height: rect.height, isExact: false, tagName: widget.tagName };
             });
 
             if (boxInfo && boxInfo.width > 0 && boxInfo.height > 0) {
                 let clickX, clickY;
                 if (boxInfo.isExact) {
-                    // 拿到了真实 checkbox，直接点正中心
                     clickX = boxInfo.x + boxInfo.width / 2;
                     clickY = boxInfo.y + boxInfo.height / 2;
-                    console.log(`>> 发现 ALTCHA 内部复选框，精确计算坐标: (${clickX.toFixed(2)}, ${clickY.toFixed(2)})`);
+                    console.log(`>> 发现 ALTCHA 内部点击目标 <${boxInfo.tagName}>，精确计算坐标: (${clickX.toFixed(2)}, ${clickY.toFixed(2)})`);
                 } else {
-                    // 退路：大框的左侧偏内
-                    clickX = boxInfo.x + 25; 
+                    clickX = boxInfo.x + Math.min(25, Math.max(12, boxInfo.width * 0.15));
                     clickY = boxInfo.y + boxInfo.height / 2;
                     console.log(`>> 未获取内部复选框，使用估算坐标: (${clickX.toFixed(2)}, ${clickY.toFixed(2)})`);
                 }
-                
-                // 1. 模拟物理鼠标精准点击
+
                 await dispatchCdpClick(page, clickX, clickY);
 
-                // 2. 【双保险兜底】JS 原生触发点击
-                // ALTCHA 防御较弱，如果上面 CDP 点偏了，这个兜底能强制让它开始算验证码
                 await page.evaluate(() => {
                     const widget = document.querySelector('altcha-widget');
                     if (widget && widget.shadowRoot) {
@@ -430,46 +548,91 @@ async function attemptAltchaClick(page) {
 async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts = 15, waitAfterClick = 8000) {
     console.log(`[${stageName}] 开始检测 ALTCHA Captcha...`);
     let sawAltcha = false;
-    
-    for (let i = 0; i < maxAttempts; i++) {
-        const altchaWidget = page.locator('altcha-widget');
-        if (await altchaWidget.count() > 0) sawAltcha = true;
 
-        if (await checkAltchaSuccess(page)) {
+    const startedAt = Date.now();
+    const totalWaitBudget = Math.max(waitAfterClick * maxAttempts, waitAfterClick);
+    let clickAttempts = 0;
+    let lastStatusText = '';
+
+    while (Date.now() - startedAt < totalWaitBudget) {
+        const status = await getAltchaStatus(page);
+        if (status.exists) sawAltcha = true;
+
+        const statusText = formatAltchaStatus(status);
+        if (status.exists && statusText !== lastStatusText) {
+            console.log(`[${stageName}] ALTCHA 状态: ${statusText}`);
+            lastStatusText = statusText;
+        }
+
+        if (status.solved) {
             console.log(`[${stageName}] ✅ ALTCHA 已通过验证。`);
             return true;
         }
 
-        const clicked = await attemptAltchaClick(page);
-        if (clicked) {
-            sawAltcha = true;
-            console.log(`[${stageName}] 已点击 ALTCHA，等待 PoW 哈希计算完成 (${waitAfterClick}ms)...`);
-            
-            // 循环轮询等待验证通过
-            let powSolved = false;
-            for(let w = 0; w < (waitAfterClick / 1000); w++) {
-                await page.waitForTimeout(1000);
-                if (await checkAltchaSuccess(page)) {
-                    powSolved = true;
-                    break;
-                }
+        if (!status.exists) {
+            await page.waitForTimeout(1000);
+            continue;
+        }
+
+        if (status.isVerifying) {
+            await page.waitForTimeout(1000);
+            continue;
+        }
+
+        if (clickAttempts >= maxAttempts) {
+            console.log(`[${stageName}] 已达到 ALTCHA 最大点击次数 (${maxAttempts})，继续等待最终结果...`);
+            await page.waitForTimeout(1000);
+            continue;
+        }
+
+        const clicked = await attemptAltchaClick(page, status);
+        if (!clicked) {
+            await page.waitForTimeout(1000);
+            continue;
+        }
+
+        clickAttempts += 1;
+        console.log(`[${stageName}] 已点击 ALTCHA，等待 PoW 哈希计算完成 (${waitAfterClick}ms)，当前点击 ${clickAttempts}/${maxAttempts}...`);
+
+        const clickStartedAt = Date.now();
+        let observedVerification = false;
+
+        while (Date.now() - clickStartedAt < waitAfterClick) {
+            await page.waitForTimeout(1000);
+
+            const followupStatus = await getAltchaStatus(page);
+            if (followupStatus.exists) sawAltcha = true;
+
+            const followupText = formatAltchaStatus(followupStatus);
+            if (followupStatus.exists && followupText !== lastStatusText) {
+                console.log(`[${stageName}] ALTCHA 状态: ${followupText}`);
+                lastStatusText = followupText;
             }
 
-            if (powSolved) {
+            if (followupStatus.solved) {
                 console.log(`[${stageName}] ✅ ALTCHA 验证通过 (PoW 计算完成)！`);
                 return true;
             }
-            console.log(`[${stageName}] ⚠️ 验证尚未通过 (可能是机器算力较慢)，继续重试...`);
+
+            if (followupStatus.isVerifying) {
+                observedVerification = true;
+                continue;
+            }
+
+            if (!observedVerification && Date.now() - clickStartedAt >= 2500) {
+                console.log(`[${stageName}] ⚠️ 点击后未观察到 ALTCHA 进入 verifying 状态，准备重新尝试点击...`);
+                break;
+            }
         }
-        
-        if (i < maxAttempts - 1) await page.waitForTimeout(1000);
     }
 
     if (!sawAltcha) {
         console.log(`[${stageName}] 弹窗中未检测到 ALTCHA 组件。`);
         return true;
     }
-    console.log(`[${stageName}] 检测到 ALTCHA，但经过 ${maxAttempts} 次尝试未能通过验证。`);
+
+    const finalStatus = await getAltchaStatus(page);
+    console.log(`[${stageName}] 检测到 ALTCHA，但在 ${Math.ceil((Date.now() - startedAt) / 1000)} 秒内未能通过验证。最终状态: ${formatAltchaStatus(finalStatus)}`);
     return false;
 }
 
@@ -477,7 +640,6 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
 // =============== 主循环执行 =================
 // ==========================================
 (async () => {
-    // 💡 提示：如果跑出了“用户 2”，说明你的 USERS_JSON 环境变量里配置了两个账号。
     const users = getUsers();
     if (users.length === 0) {
         console.log('未在 process.env.USERS_JSON 中找到用户');
